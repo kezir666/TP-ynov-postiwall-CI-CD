@@ -1,0 +1,147 @@
+# =====================================================================
+# CI/CD postit-wall
+#
+# Emplacement dans le dépôt : .github/workflows/ci-cd.yml
+#
+# Secrets à créer (Settings > Secrets and variables > Actions) :
+#   SSH_HOST         adresse ou IP du serveur
+#   SSH_USER         utilisateur SSH sur le serveur
+#   SSH_PORT         port SSH (optionnel, 22 par défaut)
+#   SSH_PRIVATE_KEY  clé privée de déploiement (contenu complet du fichier)
+#   DEPLOY_ENV       contenu du .env de production (une variable par ligne)
+# =====================================================================
+name: CI/CD postit-wall
+
+# 1. Déclencheur : un push sur main ou sur une branche feature/*
+on:
+  push:
+    branches: [main, "feature/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PROJECT_DIR: postit-wall/           # dossier qui contient docker-compose.yml, front/ et api/
+  DEPLOY_DIR: postit-wall  # dossier cible sur le serveur (relatif au home)
+
+jobs:
+  # -------------------------------------------------------------------
+  # CI : build des images puis scan Trivy (front et api en parallèle)
+  # -------------------------------------------------------------------
+  ci:
+    name: CI (${{ matrix.service }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [front, api]
+    steps:
+      - name: Récupérer le code
+        uses: actions/checkout@v4
+
+      # 2. Compilation de l'image
+      - name: Build de l'image ${{ matrix.service }}
+        run: docker build -t postit-${{ matrix.service }}:${{ github.sha }} "${PROJECT_DIR}/${{ matrix.service }}"
+
+      # 3. Scan de vulnérabilités (échoue si HIGH ou CRITICAL avec correctif disponible)
+      # Action épinglée sur le commit exact de la v0.36.0 (voir note de sécurité).
+      - name: Scan Trivy de l'image ${{ matrix.service }}
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: postit-${{ matrix.service }}:${{ github.sha }}
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+
+  # -------------------------------------------------------------------
+  # CD : déploiement sur le serveur (seulement sur main, si la CI passe)
+  # -------------------------------------------------------------------
+  cd:
+    name: CD (déploiement SSH)
+    needs: ci
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: deploy-postit
+      cancel-in-progress: false
+    env:
+      SSH_HOST: ${{ secrets.SSH_HOST }}
+      SSH_USER: ${{ secrets.SSH_USER }}
+      SSH_PORT: ${{ secrets.SSH_PORT }}
+      SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+      DEPLOY_ENV: ${{ secrets.DEPLOY_ENV }}
+    steps:
+      - name: Récupérer le code
+        uses: actions/checkout@v4
+
+      # 4. Connexion SSH avec la clé de déploiement
+      - name: Connexion SSH
+        run: |
+          for v in SSH_HOST SSH_USER SSH_PRIVATE_KEY DEPLOY_ENV; do
+            [ -n "${!v}" ] || { echo "::error::Le secret $v est vide ou absent"; exit 1; }
+          done
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -p "${SSH_PORT:-22}" -H "$SSH_HOST" >> ~/.ssh/known_hosts
+          [ -s ~/.ssh/known_hosts ] || { echo "::error::Serveur injoignable (ssh-keyscan vide)"; exit 1; }
+          cat > ~/.ssh/config <<EOF
+          Host deploy
+            HostName $SSH_HOST
+            User $SSH_USER
+            Port ${SSH_PORT:-22}
+            IdentityFile ~/.ssh/deploy_key
+            IdentitiesOnly yes
+            BatchMode yes
+            StrictHostKeyChecking yes
+          EOF
+          ssh deploy 'echo "Connecté à $(hostname) en tant que $(whoami)"'
+
+      # 5. Vérification de l'installation de Docker sur le serveur
+      - name: Vérifier Docker et Docker Compose
+        run: |
+          ssh deploy 'docker --version && docker compose version' \
+            || { echo "::error::Docker ou le plugin Compose est absent (ou l'utilisateur n'est pas dans le groupe docker)"; exit 1; }
+
+      # 6. Déploiement : copie des fichiers, écriture du .env, docker compose up
+      - name: Déployer docker-compose.yml
+        run: |
+          ssh deploy "mkdir -p '$DEPLOY_DIR'"
+          tar -C "$PROJECT_DIR" -czf - --exclude=.git --exclude=.github --exclude=.env --exclude=docs . \
+            | ssh deploy "tar -xzf - -C '$DEPLOY_DIR'"
+          printf '%s\n' "$DEPLOY_ENV" | ssh deploy "cat > '$DEPLOY_DIR/.env' && chmod 600 '$DEPLOY_DIR/.env'"
+          ssh deploy "cd '$DEPLOY_DIR' && docker compose up -d --build --remove-orphans"
+
+      # 7. Vérification des healthchecks (attend jusqu'à 120 s)
+      - name: Vérifier les healthchecks
+        run: |
+          ssh deploy "DEPLOY_DIR='$DEPLOY_DIR' bash -s" <<'REMOTE'
+          set -u
+          cd "$DEPLOY_DIR"
+          deadline=$((SECONDS + 120))
+          while true; do
+            ids=$(docker compose ps -aq)
+            all_ok=1
+            [ -n "$ids" ] || all_ok=0
+            for id in $ids; do
+              name=$(docker inspect -f '{{.Name}}' "$id")
+              status=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$id")
+              echo "$name : $status"
+              case "$status" in healthy|running) ;; *) all_ok=0 ;; esac
+            done
+            [ "$all_ok" = 1 ] && break
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "Healthchecks KO après 120 s"
+              docker compose ps -a
+              docker compose logs --tail=30
+              exit 1
+            fi
+            echo "--- nouvelle vérification dans 5 s ---"
+            sleep 5
+          done
+          echo "Test de bout en bout : front -> api -> db"
+          docker compose exec -T front wget -qO- http://localhost/api/info
+          echo
+          docker compose ps
+          REMOTE
