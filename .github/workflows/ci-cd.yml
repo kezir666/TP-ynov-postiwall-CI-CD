@@ -108,7 +108,7 @@ jobs:
       - name: Déployer docker-compose.yml
         run: |
           ssh deploy "mkdir -p '$DEPLOY_DIR'"
-          tar -C "$PROJECT_DIR" -czf - --exclude=.git --exclude=.github --exclude=.env --exclude=docs . \
+          tar -C "$PROJECT_DIR" -czf - --exclude=.git --exclude=.github --exclude=.env --exclude=doc . \
             | ssh deploy "tar -xzf - -C '$DEPLOY_DIR'"
           printf '%s\n' "$DEPLOY_ENV" | ssh deploy "cat > '$DEPLOY_DIR/.env' && chmod 600 '$DEPLOY_DIR/.env'"
           ssh deploy "cd '$DEPLOY_DIR' && docker compose up -d --build --remove-orphans"
